@@ -12,6 +12,8 @@ use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::MetadataExt;
 
 const MAGIC: &str = "# compressed by rust-gzexe\n";
+const SCRIPT_RESERVED_SIZE: usize = 2000; // Espace réservé pour le script
+const SIGNATURE: &str = "RUSTGZEXE:v1";   // Signature pour identifier nos fichiers
 
 #[derive(Debug)]
 enum CompressionAlgo {
@@ -114,7 +116,7 @@ impl Config {
     fn parse_args() -> Result<Self, String> {
         let args: Vec<String> = env::args().collect();
         if args.len() < 2 {
-            return Err("Usage: tems-exepack [-gz | -zstd | -xz] [-d] <fichiers...>".to_string());
+            return Err("Usage: rust-gzexe [-gz | -zstd | -xz] [-d] <fichiers...>".to_string());
         }
 
         let mut config = Config {
@@ -157,12 +159,19 @@ impl Config {
     }
 }
 
-// Vérifier si le fichier est déjà compressé
+// Vérifier si le fichier est déjà compressé (avec notre signature)
 fn is_compressed(path: &Path) -> io::Result<bool> {
-    let data = fs::read(path)?;
-    let magic_bytes = MAGIC.as_bytes();
-    Ok(data.windows(magic_bytes.len())
-        .any(|window| window == magic_bytes))
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0u8; 256];
+    let n = file.read(&mut buffer)?;
+    
+    if n < SIGNATURE.len() {
+        return Ok(false);
+    }
+    
+    // Chercher la signature dans les premiers caractères
+    let content = String::from_utf8_lossy(&buffer[..n]);
+    Ok(content.contains(SIGNATURE))
 }
 
 // Obtenir les bits setuid/setgid de façon portable
@@ -210,54 +219,53 @@ fn check_file(path: &Path) -> Result<fs::Metadata, String> {
     Ok(metadata)
 }
 
-// Générer un script de décompression avec décompresseur intégré
-fn generate_decompression_script() -> String {
-    r#"#!/bin/sh
-# compressed by rust-gzexe
+// Générer un script de décompression avec toutes les positions calculées
+fn generate_decompression_script(script_start: usize, decomp_size: usize, data_start: usize) -> String {
+    format!(r#"#!/bin/sh
+# {} - compressed by rust-gzexe
 set -e
 
-# Créer un répertoire temporaire
-TMPDIR=/tmp/rust-gzexe.$$
-mkdir -p "$TMPDIR" || exit 1
-trap 'rm -rf "$TMPDIR"' EXIT
+# Positions calculées par main.rs
+SCRIPT_START={}
+DECOMP_SIZE={}
+DATA_START={}
 
-# Trouver les marqueurs
 SCRIPT="$0"
-DECOMP_LINENUM=$(awk '/^__DECOMPRESSOR__$/ {print NR; exit}' "$SCRIPT")
-DATA_LINENUM=$(awk '/^__DATA__$/ {print NR; exit}' "$SCRIPT")
 
-if [ -z "$DECOMP_LINENUM" ] || [ -z "$DATA_LINENUM" ]; then
-    echo "Format invalide: marqueurs manquants" >&2
+# Créer un répertoire temporaire unique avec PID et timestamp
+TMPDIR=/tmp/rust-gzexe.$$.$(date +%s)
+mkdir -p "$TMPDIR" || exit 1
+
+# Nettoyage même si le script est tué (INT, TERM, HUP)
+trap 'rm -rf "$TMPDIR"' EXIT INT TERM HUP
+
+# Extraire le décompresseur (spécifique à l'algorithme)
+dd if="$SCRIPT" bs=1 skip=$SCRIPT_START count=$DECOMP_SIZE of="$TMPDIR/decompress" 2>/dev/null
+if [ ! -s "$TMPDIR/decompress" ]; then
+    echo "Erreur: extraction du décompresseur échouée" >&2
     exit 1
 fi
-
-# Extraire le décompresseur (entre __DECOMPRESSOR__ et __DATA__)
-tail -n +$((DECOMP_LINENUM + 1)) "$SCRIPT" | head -n $((DATA_LINENUM - DECOMP_LINENUM - 1)) > "$TMPDIR/decompress"
 chmod +x "$TMPDIR/decompress"
 
-# Extraire les données compressées (après __DATA__)
-tail -n +$((DATA_LINENUM + 1)) "$SCRIPT" > "$TMPDIR/compressed"
-
-# Vérifier que les fichiers ont été extraits
-if [ ! -s "$TMPDIR/decompress" ] || [ ! -s "$TMPDIR/compressed" ]; then
+# Extraire les données compressées (du DATA_START jusqu'à la fin)
+dd if="$SCRIPT" bs=1 skip=$DATA_START of="$TMPDIR/compressed" 2>/dev/null
+if [ ! -s "$TMPDIR/compressed" ]; then
     echo "Erreur: extraction des données échouée" >&2
     exit 1
 fi
 
-# Décompresser
+# Décompresser (le décompresseur connaît l'algorithme)
 "$TMPDIR/decompress" < "$TMPDIR/compressed" > "$TMPDIR/out"
-
-# Vérifier que la décompression a réussi
 if [ ! -s "$TMPDIR/out" ]; then
     echo "Erreur: décompression échouée" >&2
     exit 1
 fi
 
 chmod +x "$TMPDIR/out"
+
+# Exécuter le programme décompressé
 exec "$TMPDIR/out" "$@"
-__DECOMPRESSOR__
-__DATA__
-"#.to_string()
+"#, SIGNATURE, script_start, decomp_size, data_start)
 }
 
 fn create_compressed_file(
@@ -275,11 +283,15 @@ fn create_compressed_file(
     let compressed_data = algo.compress(&original_data)?;
     let compressed_size = compressed_data.len();
     
-    // Récupérer le décompresseur spécifique
+    // Récupérer le décompresseur spécifique à l'algorithme
     let decompressor = algo.decompressor_bin();
     let decompressor_size = decompressor.len();
     
-    // Calculer le ratio
+    // Calculer les positions
+    let script_start = SCRIPT_RESERVED_SIZE; // Le décompresseur commence ici
+    let data_start = script_start + decompressor_size; // Les données commencent ici
+    
+    // Calculer les ratios
     let ratio = 100.0 - (compressed_size as f64 / original_size as f64 * 100.0);
     let total_size = compressed_size + decompressor_size;
     let total_ratio = 100.0 - (total_size as f64 / original_size as f64 * 100.0);
@@ -287,22 +299,39 @@ fn create_compressed_file(
     println!("  Taille originale: {} octets", original_size);
     println!("  Taille compressée: {} octets", compressed_size);
     println!("  Taille décompresseur: {} octets", decompressor_size);
-    println!("  Taille totale: {} octets", total_size);
+    println!("  Taille totale (sans script): {} octets", total_size);
     println!("  Ratio compression: {:.1}%", ratio);
-    println!("  Ratio final (avec décompresseur): {:.1}%", total_ratio);
+    println!("  Ratio final (sans script): {:.1}%", total_ratio);
     println!("  Algorithme: {:?}", algo);
+    
+    // Générer le script avec les positions
+    let script = generate_decompression_script(script_start, decompressor_size, data_start);
+    let script_bytes = script.as_bytes();
+    let script_size = script_bytes.len();
+    
+    if script_size > SCRIPT_RESERVED_SIZE {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            format!("Script trop grand ({} > {} octets)", script_size, SCRIPT_RESERVED_SIZE)));
+    }
+    
+    println!("  Taille du script: {} octets (réservé: {})", script_size, SCRIPT_RESERVED_SIZE);
+    println!("  Décompresseur à l'octet: {}", script_start);
+    println!("  Données à l'octet: {}", data_start);
+    println!("  Taille totale finale: {} octets", SCRIPT_RESERVED_SIZE + decompressor_size + compressed_size);
     
     // Créer un fichier temporaire
     let temp_path = original_path.with_extension("tmp");
     let mut temp_file = fs::File::create(&temp_path)?;
     
-    // Écrire le script de décompression
-    let script = generate_decompression_script();
-    temp_file.write_all(script.as_bytes())?;
+    // Écrire le script
+    temp_file.write_all(script_bytes)?;
     
-    // Écrire le décompresseur
+    // Compléter avec des zéros jusqu'à SCRIPT_RESERVED_SIZE
+    let padding = vec![0u8; SCRIPT_RESERVED_SIZE - script_size];
+    temp_file.write_all(&padding)?;
+    
+    // Écrire le décompresseur (spécifique à l'algorithme)
     temp_file.write_all(decompressor)?;
-    temp_file.write_all(b"\n")?;
     
     // Écrire les données compressées
     temp_file.write_all(&compressed_data)?;
@@ -329,25 +358,52 @@ fn decompress_file(path: &Path) -> io::Result<()> {
     
     let data = fs::read(path)?;
     
-    // Chercher le magic dans le fichier
-    let magic_bytes = MAGIC.as_bytes();
-    let magic_pos = data.windows(magic_bytes.len())
-        .position(|window| window == magic_bytes);
+    if data.len() < SCRIPT_RESERVED_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, 
+            "Fichier trop court"));
+    }
     
-    let magic_pos = match magic_pos {
-        Some(pos) => pos,
-        None => return Err(io::Error::new(io::ErrorKind::InvalidData, 
-            "Fichier non compressé (magic introuvable)"))
-    };
+    // Vérifier la signature dans le script
+    let header = String::from_utf8_lossy(&data[0..SCRIPT_RESERVED_SIZE.min(256)]);
+    if !header.contains(SIGNATURE) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, 
+            "Fichier non compressé (signature introuvable)"));
+    }
     
-    // Chercher __DATA__
-    let search_start = magic_pos;
-    let data_start = data[search_start..].windows(9)
-        .position(|w| w == b"__DATA__\n")
-        .map(|pos| search_start + pos + 9)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, 
-            "Format invalide: pas de marqueur __DATA__"))?;
+    // Extraire DECOMP_SIZE et DATA_START du script
+    // On cherche les lignes "DECOMP_SIZE=..." et "DATA_START=..."
+    let content = String::from_utf8_lossy(&data[0..SCRIPT_RESERVED_SIZE]);
     
+    let mut decomp_size = 0;
+    let mut data_start = 0;
+    
+    for line in content.lines() {
+        if line.starts_with("DECOMP_SIZE=") {
+            if let Some(val) = line.split('=').nth(1) {
+                decomp_size = val.parse::<usize>().unwrap_or(0);
+                println!("  DECOMP_SIZE trouvé: {}", decomp_size);
+            }
+        }
+        if line.starts_with("DATA_START=") {
+            if let Some(val) = line.split('=').nth(1) {
+                data_start = val.parse::<usize>().unwrap_or(0);
+                println!("  DATA_START trouvé: {}", data_start);
+            }
+        }
+    }
+    
+    if decomp_size == 0 || data_start == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, 
+            "Impossible de lire les tailles dans le script"));
+    }
+    
+    // Vérifier que le fichier est assez grand
+    if data.len() < data_start {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, 
+            format!("Fichier trop court: {} < {}", data.len(), data_start)));
+    }
+    
+    // Les données compressées commencent à DATA_START
     let compressed_data = &data[data_start..];
     
     if compressed_data.is_empty() {
@@ -355,7 +411,7 @@ fn decompress_file(path: &Path) -> io::Result<()> {
             "Données compressées vides"));
     }
     
-    // Détecter l'algorithme de compression
+    // Détecter l'algorithme de compression (pour info)
     let algo = CompressionAlgo::from_magic(compressed_data)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, 
             "Format de compression inconnu"))?;
@@ -363,7 +419,7 @@ fn decompress_file(path: &Path) -> io::Result<()> {
     println!("  Algorithme détecté: {:?}", algo);
     println!("  Taille des données compressées: {} octets", compressed_data.len());
     
-    // Décompresser
+    // Décompresser avec l'algorithme détecté
     let decompressed_data = algo.decompress(compressed_data)?;
     
     println!("  Taille décompressée: {} octets", decompressed_data.len());
