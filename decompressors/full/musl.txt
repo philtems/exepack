@@ -1,0 +1,3 @@
+musl-gcc -o lz77 lz77.c -Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections -static
+
+musl-gcc -o lz77 lz77.c -Os -s -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident -fmerge-all-constants -fshort-enums -Wl,--gc-sections -Wl,--strip-all -Wl,--build-id=none -Wl,--hash-style=gnu -nostdlib -nostdinc -static -ffreestanding
