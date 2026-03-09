@@ -1,18 +1,20 @@
 [package]
-name = "tems-exepack"
-version = "0.5.0"
+name = "zexe"
+version = "0.1.0"
+authors = ["Philippe TEMESI <philippe@tems.be>"]
 edition = "2021"
-build = "build.rs"
-authors = ["Philippe TEMESI"]
-description = "Executable file compressor with system compressors and embedded TEMS XZ decompressor"
+description = "Self-extracting executable compressor inspired by OpenBSD gzexe"
 license = "MIT"
 repository = "https://www.tems.be"
 
 [dependencies]
 flate2 = "1.0"
-xz2 = "0.1"
-bzip2 = "0.4"
 
-[build-dependencies]
-cc = "1.0"
-
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+split-debuginfo = "packed"
+strip = true
+incremental = true
