@@ -17,17 +17,14 @@ zexe compresses executable files using **Zopfli** (maximum gzip-compatible compr
 
 ---
 
-# Compress an executable
+### Compress an executable
 zexe /path/to/program
 
-# Compress with verbose output
-zexe /path/to/program
-
-# Decompress back to original
+### Decompress back to original
 zexe -d /path/to/program
 
-# Show help
+### Show help
 zexe -h
 
-# Show version
+### Show version
 zexe -V
