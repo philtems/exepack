@@ -3,18 +3,11 @@ name = "zexe"
 version = "0.1.0"
 authors = ["Philippe TEMESI <philippe@tems.be>"]
 edition = "2021"
-description = "Self-extracting executable compressor inspired by OpenBSD gzexe"
+description = "Self-extracting executable compressor using Zopfli (max compression)"
 license = "MIT"
 repository = "https://www.tems.be"
 
 [dependencies]
-flate2 = "1.0"
+zopfli = { version = "0.8", features = ["gzip", "std"] }
+flate2 = "1.0"  # Gardé pour la décompression uniquement
 
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = "s"
-panic = "abort"
-split-debuginfo = "packed"
-strip = true
-incremental = true

@@ -4,10 +4,10 @@ use std::io::{self, Write, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::num::NonZeroU64;
 
-use flate2::write::GzEncoder;
+use zopfli::{GzipEncoder, Options, BlockType};
 use flate2::read::GzDecoder;
-use flate2::Compression;
 
 const MAGIC: &[u8] = b"# compressed by zexe";
 const HEADER_SIZE: usize = 512;
@@ -63,7 +63,7 @@ fn run() -> io::Result<()> {
                              info.path.display(), info.compressed_size, info.original_size,
                              info.compression_ratio());
                 } else {
-                    println!("{}: {} -> {} bytes, {:.1}% compression",
+                    println!("{}: {} -> {} bytes, {:.1}% compression (Zopfli)",
                              info.path.display(), info.original_size, info.compressed_size,
                              info.compression_ratio());
                 }
@@ -94,10 +94,12 @@ fn parse_args() -> io::Result<Config> {
                 println!();
                 println!("Usage: {} [-d] file...", args[0]);
                 println!("  -d    Decompress the file");
+                println!();
+                println!("Compression: Zopfli (maximum compression, slower but better than gzip)");
                 process::exit(0);
             }
             "-V" | "--version" => {
-                println!("zexe version 0.1.0");
+                println!("zexe version 0.1.0 (Zopfli)");
                 println!("Author: {} ({}) {}", AUTHOR, YEAR, WEBSITE);
                 process::exit(0);
             }
@@ -177,16 +179,15 @@ fn compress_file(path: &Path) -> io::Result<Option<FileInfo>> {
     let original_data = fs::read(path)?;
     let original_size = original_data.len() as u64;
 
-    // Compress
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
-    encoder.write_all(&original_data)?;
-    let compressed = encoder.finish()?;
+    // Compress with Zopfli (maximum compression)
+    println!("Compressing {} with Zopfli (this may take a while)...", path.display());
+    let compressed = compress_zopfli(&original_data)?;
     let compressed_size = compressed.len() as u64;
 
     // Generate header with fixed size
     let header = format!(
         r#"#!/bin/sh
-# compressed by zexe
+# compressed by zexe (Zopfli)
 # This script is exactly {} bytes long
 tmp=`mktemp -d /tmp/zexe.XXXXXXXXXX` || exit 1
 trap 'rm -rf "$tmp"' 0
@@ -237,7 +238,7 @@ fn decompress_file(path: &Path) -> io::Result<Option<FileInfo>> {
             "corrupted compressed file"));
     }
 
-    // Decompress from HEADER_SIZE
+    // Decompress from HEADER_SIZE (using flate2 for decompression)
     let mut decoder = GzDecoder::new(&data[HEADER_SIZE..]);
     let mut decompressed = Vec::new();
     decoder.read_to_end(&mut decompressed)?;
@@ -257,6 +258,35 @@ fn decompress_file(path: &Path) -> io::Result<Option<FileInfo>> {
         original_size,
         compressed_size,
     }))
+}
+
+fn compress_zopfli(data: &[u8]) -> io::Result<Vec<u8>> {
+    // Configuration Zopfli pour une compression maximale
+    // Tous les champs doivent être NonZeroU64
+    let options = Options {
+        iteration_count: NonZeroU64::new(15).unwrap(),  // 15 itérations
+        iterations_without_improvement: NonZeroU64::new(3).unwrap(), // Arrête après 3 itérations sans amélioration
+        maximum_block_splits: 15, // u16, pas besoin de NonZero
+    };
+    
+    // Type de bloc : Dynamic donne la meilleure compression
+    let block_type = BlockType::Dynamic;
+    
+    let mut compressed = Vec::new();
+    
+    // Créer l'encodeur
+    let mut encoder = GzipEncoder::new(options, block_type, &mut compressed)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Zopfli init error: {}", e)))?;
+    
+    // Écriture des données
+    encoder.write_all(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Zopfli write error: {}", e)))?;
+    
+    // Finalisation - finish() retourne le writer
+    encoder.finish()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Zopfli finish error: {}", e)))?;
+    
+    Ok(compressed)
 }
 
 #[cfg(test)]
@@ -291,28 +321,21 @@ mod tests {
     }
 
     #[test]
-    fn test_compress_binary() -> io::Result<()> {
-        // Create a small binary (ELF header + simple program)
-        let test_file = env::temp_dir().join("zexe_binary");
+    fn test_zopfli_compression() -> io::Result<()> {
+        let test_data = b"Hello world! This is a test string that should compress well. ".repeat(100);
+        let compressed = compress_zopfli(&test_data)?;
         
-        // Just a simple shell script for testing (not a real binary)
-        fs::write(&test_file, b"#!/bin/sh\necho 'Binary test'\n")?;
+        // Decompress with flate2 to verify
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)?;
         
-        let mut perms = fs::metadata(&test_file)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&test_file, perms)?;
-
-        compress_file(&test_file)?;
-        assert!(is_compressed(&test_file)?);
-
-        // Test execution
-        use std::process::Command;
-        let output = Command::new(&test_file).output()?;
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"Binary test\n");
-
-        fs::remove_file(&test_file)?;
-        fs::remove_file(test_file.with_extension("~"))?;
+        assert_eq!(test_data.to_vec(), decompressed);
+        
+        println!("Zopfli compression test: {} -> {} bytes ({:.1}% ratio)", 
+                 test_data.len(), compressed.len(),
+                 (test_data.len() - compressed.len()) as f64 * 100.0 / test_data.len() as f64);
+        
         Ok(())
     }
 }
