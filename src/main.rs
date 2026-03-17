@@ -19,6 +19,33 @@ const WEBSITE: &str = "https://www.tems.be";
 struct Config {
     decompress: bool,
     files: Vec<PathBuf>,
+    compression_level: CompressionLevel,
+    iterations: Option<NonZeroU64>,
+    iterations_without_improvement: Option<NonZeroU64>,
+    max_block_splits: Option<u16>,
+    block_type: BlockType,
+    verbose: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompressionLevel {
+    Fast,      // Compression rapide, moins bonne
+    Normal,    // Équilibre (défaut)
+    Maximum,   // Bonne compression, plus lent
+    Ultra,     // Compression extrême, très lent
+    Custom,    // Paramètres personnalisés
+}
+
+impl CompressionLevel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CompressionLevel::Fast => "fast",
+            CompressionLevel::Normal => "normal",
+            CompressionLevel::Maximum => "maximum",
+            CompressionLevel::Ultra => "ultra",
+            CompressionLevel::Custom => "custom",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -49,11 +76,12 @@ fn run() -> io::Result<()> {
     let config = parse_args()?;
     let mut exit_code = 0;
 
-    for file in config.files {
+    // CORRECTION: Itérer sur une référence avec &config.files
+    for file in &config.files {
         let result = if config.decompress {
-            decompress_file(&file)
+            decompress_file(file)  // Note: on passe &file directement
         } else {
-            compress_file(&file)
+            compress_file(file, &config)  // Note: on passe &file directement
         };
 
         match result {
@@ -63,9 +91,9 @@ fn run() -> io::Result<()> {
                              info.path.display(), info.compressed_size, info.original_size,
                              info.compression_ratio());
                 } else {
-                    println!("{}: {} -> {} bytes, {:.1}% compression (Zopfli)",
+                    println!("{}: {} -> {} bytes, {:.1}% compression (Zopfli - {})",
                              info.path.display(), info.original_size, info.compressed_size,
-                             info.compression_ratio());
+                             info.compression_ratio(), config.compression_level.as_str());
                 }
             }
             Ok(None) => {}
@@ -83,24 +111,94 @@ fn parse_args() -> io::Result<Config> {
     let args: Vec<String> = env::args().collect();
     let mut decompress = false;
     let mut files = Vec::new();
+    let mut compression_level = CompressionLevel::Normal;
+    let mut iterations = None;
+    let mut iterations_without_improvement = None;
+    let mut max_block_splits = None;
+    let mut block_type = BlockType::Dynamic;
+    let mut verbose = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "-d" => decompress = true,
+            "-1" | "--fast" => compression_level = CompressionLevel::Fast,
+            "-2" | "--normal" => compression_level = CompressionLevel::Normal,
+            "-3" | "--maximum" => compression_level = CompressionLevel::Maximum,
+            "-4" | "--ultra" => compression_level = CompressionLevel::Ultra,
+            "--custom" => {
+                compression_level = CompressionLevel::Custom;
+                // Les paramètres personnalisés seront lus via d'autres options
+            }
+            "--iterations" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "Missing value for --iterations"));
+                }
+                let val = args[i].parse::<u64>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput,
+                        "Invalid number for --iterations"))?;
+                if val == 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "Iterations must be > 0"));
+                }
+                iterations = Some(NonZeroU64::new(val).unwrap());
+                compression_level = CompressionLevel::Custom;
+            }
+            "--iter-without-improvement" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "Missing value for --iter-without-improvement"));
+                }
+                let val = args[i].parse::<u64>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput,
+                        "Invalid number for --iter-without-improvement"))?;
+                if val == 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "Iterations without improvement must be > 0"));
+                }
+                iterations_without_improvement = Some(NonZeroU64::new(val).unwrap());
+                compression_level = CompressionLevel::Custom;
+            }
+            "--max-block-splits" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "Missing value for --max-block-splits"));
+                }
+                let val = args[i].parse::<u16>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput,
+                        "Invalid number for --max-block-splits"))?;
+                max_block_splits = Some(val);
+                compression_level = CompressionLevel::Custom;
+            }
+            "--block-type" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "Missing value for --block-type"));
+                }
+                block_type = match args[i].as_str() {
+                    "dynamic" => BlockType::Dynamic,
+                    "fixed" => BlockType::Fixed,
+                    _ => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                            "Block type must be 'dynamic' or 'fixed'"));
+                    }
+                };
+                compression_level = CompressionLevel::Custom;
+            }
+            "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => {
-                println!("zexe - Self-extracting executable compressor");
-                println!("Author: {} ({}) {}", AUTHOR, YEAR, WEBSITE);
-                println!();
-                println!("Usage: {} [-d] file...", args[0]);
-                println!("  -d    Decompress the file");
-                println!();
-                println!("Compression: Zopfli (maximum compression, slower but better than gzip)");
+                print_help(&args[0]);
                 process::exit(0);
             }
             "-V" | "--version" => {
-                println!("zexe version 0.1.0 (Zopfli)");
+                println!("zexe version 0.2.0 (Zopfli)");
                 println!("Author: {} ({}) {}", AUTHOR, YEAR, WEBSITE);
+                println!("Compression levels: fast, normal (default), maximum, ultra");
                 process::exit(0);
             }
             arg if arg.starts_with('-') => {
@@ -117,7 +215,91 @@ fn parse_args() -> io::Result<Config> {
             "No files specified"));
     }
 
-    Ok(Config { decompress, files })
+    Ok(Config {
+        decompress,
+        files,
+        compression_level,
+        iterations,
+        iterations_without_improvement,
+        max_block_splits,
+        block_type,
+        verbose,
+    })
+}
+
+fn print_help(program: &str) {
+    println!("zexe - Self-extracting executable compressor");
+    println!("Author: {} ({}) {}", AUTHOR, YEAR, WEBSITE);
+    println!();
+    println!("Usage: {} [OPTIONS] file...", program);
+    println!();
+    println!("Options:");
+    println!("  -d                    Decompress the file");
+    println!("  -1, --fast            Fast compression (lower ratio)");
+    println!("  -2, --normal          Normal compression (default)");
+    println!("  -3, --maximum          Maximum compression");
+    println!("  -4, --ultra            Ultra compression (very slow)");
+    println!("  --custom               Use custom compression parameters");
+    println!("  --iterations N         Number of iterations (default varies)");
+    println!("  --iter-without-improvement N");
+    println!("                         Stop after N iterations without improvement");
+    println!("  --max-block-splits N   Maximum number of block splits");
+    println!("  --block-type TYPE      Block type: dynamic or fixed");
+    println!("  -v, --verbose           Verbose output");
+    println!("  -h, --help             Show this help");
+    println!("  -V, --version          Show version");
+    println!();
+    println!("Compression levels:");
+    println!("  fast:    15 iterations, 3 without improvement, 15 splits");
+    println!("  normal:  30 iterations, 5 without improvement, 25 splits (default)");
+    println!("  maximum: 75 iterations, 12 without improvement, 50 splits");
+    println!("  ultra:   200 iterations, 30 without improvement, 100 splits");
+    println!();
+    println!("Examples:");
+    println!("  {} myprogram            # Compress with normal settings", program);
+    println!("  {} --ultra myprogram    # Maximum compression", program);
+    println!("  {} -d myprogram         # Decompress", program);
+    println!("  {} --iterations 100 --max-block-splits 75 myprogram", program);
+}
+
+fn get_compression_options(config: &Config) -> Options {
+    match config.compression_level {
+        CompressionLevel::Fast => {
+            Options {
+                iteration_count: NonZeroU64::new(15).unwrap(),
+                iterations_without_improvement: NonZeroU64::new(3).unwrap(),
+                maximum_block_splits: 15,
+            }
+        }
+        CompressionLevel::Normal => {
+            Options {
+                iteration_count: NonZeroU64::new(30).unwrap(),
+                iterations_without_improvement: NonZeroU64::new(5).unwrap(),
+                maximum_block_splits: 25,
+            }
+        }
+        CompressionLevel::Maximum => {
+            Options {
+                iteration_count: NonZeroU64::new(75).unwrap(),
+                iterations_without_improvement: NonZeroU64::new(12).unwrap(),
+                maximum_block_splits: 50,
+            }
+        }
+        CompressionLevel::Ultra => {
+            Options {
+                iteration_count: NonZeroU64::new(200).unwrap(),
+                iterations_without_improvement: NonZeroU64::new(30).unwrap(),
+                maximum_block_splits: 100,
+            }
+        }
+        CompressionLevel::Custom => {
+            Options {
+                iteration_count: config.iterations.unwrap_or_else(|| NonZeroU64::new(30).unwrap()),
+                iterations_without_improvement: config.iterations_without_improvement.unwrap_or_else(|| NonZeroU64::new(5).unwrap()),
+                maximum_block_splits: config.max_block_splits.unwrap_or(25),
+            }
+        }
+    }
 }
 
 fn is_compressed(path: &Path) -> io::Result<bool> {
@@ -163,7 +345,7 @@ fn check_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn compress_file(path: &Path) -> io::Result<Option<FileInfo>> {
+fn compress_file(path: &Path, config: &Config) -> io::Result<Option<FileInfo>> {
     if is_compressed(path)? {
         return Err(io::Error::new(io::ErrorKind::AlreadyExists,
             "file already compressed"));
@@ -179,9 +361,22 @@ fn compress_file(path: &Path) -> io::Result<Option<FileInfo>> {
     let original_data = fs::read(path)?;
     let original_size = original_data.len() as u64;
 
-    // Compress with Zopfli (maximum compression)
-    println!("Compressing {} with Zopfli (this may take a while)...", path.display());
-    let compressed = compress_zopfli(&original_data)?;
+    // Get compression options
+    let options = get_compression_options(config);
+    
+    if config.verbose {
+        eprintln!("Compression settings:");
+        eprintln!("  Iterations: {}", options.iteration_count);
+        eprintln!("  Iterations without improvement: {}", options.iterations_without_improvement);
+        eprintln!("  Max block splits: {}", options.maximum_block_splits);
+        eprintln!("  Block type: {:?}", config.block_type);
+    }
+
+    // Compress with Zopfli
+    println!("Compressing {} with Zopfli ({} level, this may take a while)...", 
+             path.display(), config.compression_level.as_str());
+    
+    let compressed = compress_zopfli(&original_data, options, config.block_type)?;
     let compressed_size = compressed.len() as u64;
 
     // Generate header with fixed size
@@ -216,6 +411,15 @@ exit $?
 
     // Replace original
     fs::rename(&temp_path, path)?;
+
+    if config.verbose {
+        eprintln!("Compression complete:");
+        eprintln!("  Original size: {} bytes", original_size);
+        eprintln!("  Compressed size: {} bytes", compressed_size + header_bytes.len() as u64);
+        eprintln!("  Header size: {} bytes", header_bytes.len());
+        eprintln!("  Compression ratio: {:.1}%", 
+                 (original_size - compressed_size) as f64 * 100.0 / original_size as f64);
+    }
 
     Ok(Some(FileInfo {
         path: path.to_path_buf(),
@@ -260,18 +464,7 @@ fn decompress_file(path: &Path) -> io::Result<Option<FileInfo>> {
     }))
 }
 
-fn compress_zopfli(data: &[u8]) -> io::Result<Vec<u8>> {
-    // Configuration Zopfli pour une compression maximale
-    // Tous les champs doivent être NonZeroU64
-    let options = Options {
-        iteration_count: NonZeroU64::new(15).unwrap(),  // 15 itérations
-        iterations_without_improvement: NonZeroU64::new(3).unwrap(), // Arrête après 3 itérations sans amélioration
-        maximum_block_splits: 15, // u16, pas besoin de NonZero
-    };
-    
-    // Type de bloc : Dynamic donne la meilleure compression
-    let block_type = BlockType::Dynamic;
-    
+fn compress_zopfli(data: &[u8], options: Options, block_type: BlockType) -> io::Result<Vec<u8>> {
     let mut compressed = Vec::new();
     
     // Créer l'encodeur
@@ -282,7 +475,7 @@ fn compress_zopfli(data: &[u8]) -> io::Result<Vec<u8>> {
     encoder.write_all(data)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Zopfli write error: {}", e)))?;
     
-    // Finalisation - finish() retourne le writer
+    // Finalisation
     encoder.finish()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Zopfli finish error: {}", e)))?;
     
@@ -303,7 +496,18 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&test_file, perms)?;
 
-        compress_file(&test_file)?;
+        let config = Config {
+            decompress: false,
+            files: vec![test_file.clone()],
+            compression_level: CompressionLevel::Normal,
+            iterations: None,
+            iterations_without_improvement: None,
+            max_block_splits: None,
+            block_type: BlockType::Dynamic,
+            verbose: false,
+        };
+
+        compress_file(&test_file, &config)?;
         assert!(is_compressed(&test_file)?);
 
         // Test execution of compressed file
@@ -321,20 +525,54 @@ mod tests {
     }
 
     #[test]
-    fn test_zopfli_compression() -> io::Result<()> {
+    fn test_zopfli_compression_levels() -> io::Result<()> {
         let test_data = b"Hello world! This is a test string that should compress well. ".repeat(100);
-        let compressed = compress_zopfli(&test_data)?;
         
-        // Decompress with flate2 to verify
-        let mut decoder = GzDecoder::new(&compressed[..]);
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)?;
-        
-        assert_eq!(test_data.to_vec(), decompressed);
-        
-        println!("Zopfli compression test: {} -> {} bytes ({:.1}% ratio)", 
-                 test_data.len(), compressed.len(),
-                 (test_data.len() - compressed.len()) as f64 * 100.0 / test_data.len() as f64);
+        let levels = [
+            CompressionLevel::Fast,
+            CompressionLevel::Normal,
+            CompressionLevel::Maximum,
+            CompressionLevel::Ultra,
+        ];
+
+        for level in levels {
+            let options = match level {
+                CompressionLevel::Fast => Options {
+                    iteration_count: NonZeroU64::new(15).unwrap(),
+                    iterations_without_improvement: NonZeroU64::new(3).unwrap(),
+                    maximum_block_splits: 15,
+                },
+                CompressionLevel::Normal => Options {
+                    iteration_count: NonZeroU64::new(30).unwrap(),
+                    iterations_without_improvement: NonZeroU64::new(5).unwrap(),
+                    maximum_block_splits: 25,
+                },
+                CompressionLevel::Maximum => Options {
+                    iteration_count: NonZeroU64::new(75).unwrap(),
+                    iterations_without_improvement: NonZeroU64::new(12).unwrap(),
+                    maximum_block_splits: 50,
+                },
+                CompressionLevel::Ultra => Options {
+                    iteration_count: NonZeroU64::new(200).unwrap(),
+                    iterations_without_improvement: NonZeroU64::new(30).unwrap(),
+                    maximum_block_splits: 100,
+                },
+                CompressionLevel::Custom => unreachable!(),
+            };
+
+            let compressed = compress_zopfli(&test_data, options, BlockType::Dynamic)?;
+            
+            // Decompress with flate2 to verify
+            let mut decoder = GzDecoder::new(&compressed[..]);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            
+            assert_eq!(test_data.to_vec(), decompressed);
+            
+            println!("Zopfli {:?}: {} -> {} bytes ({:.1}% ratio)", 
+                     level, test_data.len(), compressed.len(),
+                     (test_data.len() - compressed.len()) as f64 * 100.0 / test_data.len() as f64);
+        }
         
         Ok(())
     }
